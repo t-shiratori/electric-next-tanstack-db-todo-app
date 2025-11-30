@@ -94,6 +94,10 @@ createCollection(
 
 #### Electric Collection（新）
 ```typescript
+// Electric SQL設定
+const ELECTRIC_URL = process.env.NEXT_PUBLIC_ELECTRIC_URL || "http://localhost:3000";
+const electric = { url: ELECTRIC_URL };
+
 createCollection(
   electricCollectionOptions<Todo>({
     // Shape options for Electric sync
@@ -108,12 +112,19 @@ createCollection(
     // 書き込み操作は API 経由で行い、txid を返す
     onUpdate: async ({ transaction }) => {
       const mutation = transaction.mutations[0];
+      if (!mutation) return;
+
       const { original, modified } = mutation;
       const response = await fetch(`/api/todos/${original.id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(modified),
       });
+
+      if (!response.ok) {
+        throw new Error("Failed to update todo");
+      }
+
       const data = await response.json();
       // txid を返すことで Electric が同期を確認するまで待機
       return { txid: data.txid };
@@ -128,7 +139,7 @@ createCollection(
 1. **データ同期の仕組み**
    - **Query Collection**: REST API を介して手動でデータを取得・更新
    - **Electric Collection**:
-     - **読み取り**: Electric サービスが PostgreSQL の変更を自動的に検知してクライアントに同期
+     - **読み取り**: Electric サービスが PostgreSQL の変更を自動的に検知し、接続中の全クライアントにブロードキャスト
      - **書き込み**: REST API 経由で PostgreSQL に書き込み、txid を使って同期を確認
 
 2. **実装のシンプルさ**
@@ -138,8 +149,8 @@ createCollection(
      - 書き込みは`onUpdate`, `onInsert`, `onDelete`を実装し、txidを返す
 
 3. **リアルタイム性**
-   - **Query Collection**: ポーリングまたは手動リフレッシュが必要
-   - **Electric Collection**: PostgreSQL の変更が即座にクライアントに反映される
+   - **Query Collection**: クライアント主導のポーリングやフォーカス時の再取得に依存
+   - **Electric Collection**: PostgreSQL の変更がサーバーから全クライアントにブロードキャストされ、即座に反映される
 
 4. **txid による同期保証**
    - **Electric Collection**: API が返す txid を使って、Electric がデータを同期するまで待機
@@ -147,15 +158,312 @@ createCollection(
 
 ### データフロー
 
+Electric SQLとTanStack DBの統合には、**読み取り（Read）**と**書き込み（Write）**で異なるフローがあります。
+
+#### 📖 読み取りフロー（リアルタイム同期）
+
 ```
-PostgreSQL → Electric Service → WebSocket → Client (Electric Collection) → TanStack DB → React UI
+┌─────────────┐         ┌─────────────────┐         ┌──────────────────┐
+│ PostgreSQL  │  WAL    │ Electric Service│ HTTP/SSE │ Client Browser   │
+│   Database  │────────▶│  (Sync Engine)  │─────────▶│ Electric         │
+│             │ Repl.   │                 │ Stream   │ Collection       │
+└─────────────┘         └─────────────────┘          └──────────────────┘
+                                                              │
+                                                              │ 自動更新
+                                                              ▼
+                                                      ┌──────────────────┐
+                                                      │ TanStack DB      │
+                                                      │ (In-Memory)      │
+                                                      └──────────────────┘
+                                                              │
+                                                              │ リアクティブ
+                                                              ▼
+                                                      ┌──────────────────┐
+                                                      │ React UI         │
+                                                      │ (useLiveQuery)   │
+                                                      └──────────────────┘
 ```
 
-1. PostgreSQL でデータが変更される
-2. Electric サービスが変更を検知（WAL レプリケーション）
-3. WebSocket を通じてクライアントに変更を送信
-4. Electric Collection が変更を受け取り、TanStack DB を更新
-5. Live Query が自動的に再評価され、UI が更新される
+**ステップ解説：**
+
+1. **PostgreSQL での変更**: データベースに変更が発生（INSERT/UPDATE/DELETE）
+2. **WALレプリケーション**: Electric ServiceがPostgreSQLのWrite-Ahead Logを監視し、変更を検知
+3. **Shape Stream API**: Electric ServiceがHTTP/SSE（Server-Sent Events）を通じて変更を接続中の全クライアントにブロードキャスト
+4. **Electric Collection**: クライアントが変更を受信し、TanStack DBのインメモリデータを自動更新
+5. **Live Queryの再評価**: データ変更により`useLiveQuery`が自動的に再実行される
+6. **UIの自動更新**: Reactコンポーネントが新しいデータで再レンダリング
+
+#### ✏️ 書き込みフロー（楽観的更新 + サーバー同期）
+
+```
+┌──────────────────┐         ┌─────────────────┐         ┌─────────────┐
+│ Client Browser   │  REST   │ Next.js API     │  SQL    │ PostgreSQL  │
+│ (User Action)    │────────▶│ Route Handler   │────────▶│  Database   │
+│                  │  API    │                 │ Query   │             │
+└──────────────────┘         └─────────────────┘         └─────────────┘
+       │                              │                          │
+       │ 1. Optimistic Update         │ 2. DB Write             │
+       │                              │ 3. Return txid          │
+       ▼                              ▼                          │
+┌──────────────────┐         ┌─────────────────┐              │
+│ TanStack DB      │         │ Response:       │              │
+│ (即座に更新)       │         │ { txid: "..." } │              │
+└──────────────────┘         └─────────────────┘              │
+       │                              │                          │
+       │ 4. Wait for txid            │                          │
+       │    from Electric             │                          │
+       ▼                              │                          │
+┌──────────────────┐                 │                          │
+│ Electric         │◀────────────────┘                          │
+│ Collection       │  5. Electric が同期確認                      │
+│ (同期完了待機)     │◀────────────────────────────────────────────┘
+└──────────────────┘  Shape Stream API 経由でデータ受信
+```
+
+**ステップ解説：**
+
+1. **楽観的更新**: ユーザーアクション（例: `todoCollection.update()`）が即座にクライアント側のデータを更新
+2. **REST API呼び出し**: `onUpdate`ハンドラーがNext.js API Routeを呼び出し
+3. **データベースへの書き込み**: API RouteがPostgreSQLにデータを書き込み、トランザクションID（txid）を取得
+4. **txidの返却**: APIが`{ txid: "..." }`をクライアントに返却
+5. **同期確認待機**: Electric CollectionがElectric Serviceから同じtxidを持つ変更を受信するまで待機
+6. **同期完了**: txidが一致したら、楽観的更新が確定（サーバーと同期済み）
+
+#### 🔄 完全なラウンドトリップの例
+
+ユーザーがTodoを完了状態に変更した場合：
+
+```
+1. [UI] ユーザーがチェックボックスをクリック
+   ↓
+2. [Client] todoCollection.update(id, { completed: true })
+   ↓ (即座に UI が更新される - 楽観的更新)
+3. [Client] onUpdate ハンドラーが /api/todos/:id へ PUT リクエスト
+   ↓
+4. [API] PostgreSQL に UPDATE 実行
+   ↓
+5. [API] txid を取得して返却 { txid: "1234567890" }
+   ↓
+6. [Electric] PostgreSQL の WAL から変更を検知
+   ↓
+7. [Electric] Shape Stream API 経由でクライアントに変更を配信
+   ↓
+8. [Client] Electric Collection が txid: "1234567890" を受信
+   ↓
+9. [Client] 同期完了！楽観的更新が確定される
+   ↓
+10. [UI] 同期状態がユーザーに表示される（例: 保存完了アイコン）
+```
+
+#### 💡 重要なポイント
+
+- **読み取りは完全に自動**: Shape Stream APIにより、PostgreSQLの変更が全クライアントに自動的にブロードキャスト
+- **書き込みは明示的**: REST APIを使用し、`onUpdate`/`onInsert`/`onDelete`で実装
+- **txidによる保証**: 楽観的更新がサーバーと確実に同期されたことを確認できる
+- **競合解決**: Electricが最新のサーバーデータを全クライアントに配信するため、競合が自動的に解決される
+
+### シーケンス図
+
+Electric SQLとTanStack DBの動作をシーケンス図で詳細に示します。
+
+#### 📖 読み取り（初期ロード）のシーケンス図
+
+```
+User          Component      Collection    Electric      PostgreSQL
+ │                │              │          Service          │
+ │  ページ表示      │              │            │              │
+ │───────────────>│              │            │              │
+ │                │ mount()      │            │              │
+ │                │─────────────>│            │              │
+ │                │              │ connect    │              │
+ │                │              │───────────>│              │
+ │                │              │            │ subscribe    │
+ │                │              │            │─────────────>│
+ │                │              │            │  (WAL)       │
+ │                │              │            │              │
+ │                │              │ snapshot   │              │
+ │                │              │<───────────│              │
+ │                │              │            │              │
+ │                │  data        │            │              │
+ │                │<─────────────│            │              │
+ │                │              │            │              │
+ │  render        │              │            │              │
+ │<───────────────│              │            │              │
+ │                │              │            │              │
+ │                │              │ stream     │  changes     │
+ │                │              │<───────────│<─────────────│
+ │                │              │            │   (real-time)│
+ │                │  update      │            │              │
+ │                │<─────────────│            │              │
+ │  再render      │              │            │              │
+ │<───────────────│              │            │              │
+```
+
+**解説:**
+1. ユーザーがページを表示すると、Reactコンポーネントがマウント
+2. CollectionがElectric Serviceに接続し、Shape Stream APIを開始
+3. Electric ServiceがPostgreSQLのWALをサブスクライブ
+4. 初期データスナップショットがCollectionに送信される
+5. Componentが初期データでレンダリング
+6. その後、PostgreSQLの変更がリアルタイムで接続中の全クライアントにブロードキャストされる
+7. 変更を受信するたびにComponentが自動的に再レンダリング
+
+#### ✏️ 書き込み（楽観的更新）のシーケンス図
+
+```
+User     Component  Collection  API Route  PostgreSQL  Electric
+ │           │          │           │          │       Service
+ │ クリック   │          │           │          │          │
+ │──────────>│          │           │          │          │
+ │           │ update() │           │          │          │
+ │           │─────────>│           │          │          │
+ │           │          │           │          │          │
+ │           │          │[楽観的更新]│          │          │
+ │           │          │ (即座)    │          │          │
+ │           │  data    │           │          │          │
+ │           │<─────────│           │          │          │
+ │  即座にUI  │          │           │          │          │
+ │  更新     │          │           │          │          │
+ │<──────────│          │           │          │          │
+ │           │          │           │          │          │
+ │           │          │ onUpdate()│          │          │
+ │           │          │──────────>│          │          │
+ │           │          │           │ INSERT/  │          │
+ │           │          │           │ UPDATE   │          │
+ │           │          │           │─────────>│          │
+ │           │          │           │          │          │
+ │           │          │           │ txid     │          │
+ │           │          │           │<─────────│          │
+ │           │          │  {txid}   │          │          │
+ │           │          │<──────────│          │          │
+ │           │          │           │          │          │
+ │           │          │[待機中: txid一致を待つ]│          │
+ │           │          │           │          │ WAL      │
+ │           │          │           │          │─────────>│
+ │           │          │           │          │          │
+ │           │          │   stream(txid)       │          │
+ │           │          │<─────────────────────│          │
+ │           │          │           │          │          │
+ │           │          │[txid一致確認]         │          │
+ │           │          │[同期完了]  │          │          │
+ │           │          │           │          │          │
+ │           │ confirmed│           │          │          │
+ │           │<─────────│           │          │          │
+ │  同期完了  │          │           │          │          │
+ │  アイコン  │          │           │          │          │
+ │<──────────│          │           │          │          │
+```
+
+**解説:**
+1. ユーザーがUI操作（例: チェックボックスをクリック）
+2. Collectionが即座に楽観的更新を実行（UIが即座に反応）
+3. onUpdateハンドラーがバックグラウンドでAPI Routeを呼び出し
+4. API RouteがPostgreSQLにデータを書き込み、txidを取得
+5. txidがCollectionに返却される
+6. PostgreSQLの変更がWAL経由でElectric Serviceに通知
+7. Electric Serviceが同じtxidを持つ変更を接続中の全クライアントにブロードキャスト
+8. Collectionがtxid一致を確認し、楽観的更新を「確定」
+9. UIに同期完了を表示
+
+#### ⚠️ エラー時のシーケンス図
+
+```
+User     Component  Collection  API Route  PostgreSQL
+ │           │          │           │          │
+ │ クリック   │          │           │          │
+ │──────────>│          │           │          │
+ │           │ update() │           │          │
+ │           │─────────>│           │          │
+ │           │          │           │          │
+ │           │          │[楽観的更新]│          │
+ │           │  data    │           │          │
+ │           │<─────────│           │          │
+ │  UI更新   │          │           │          │
+ │<──────────│          │           │          │
+ │           │          │           │          │
+ │           │          │ onUpdate()│          │
+ │           │          │──────────>│          │
+ │           │          │           │ UPDATE   │
+ │           │          │           │─────────>│
+ │           │          │           │          │
+ │           │          │           │ ERROR!   │
+ │           │          │           │<─────────│
+ │           │          │  Error    │          │
+ │           │          │<──────────│          │
+ │           │          │           │          │
+ │           │          │[自動ロールバック]     │
+ │           │          │[元の状態に戻す]       │
+ │           │          │           │          │
+ │           │ rollback │           │          │
+ │           │<─────────│           │          │
+ │  UI元に   │          │           │          │
+ │  戻る     │          │           │          │
+ │<──────────│          │           │          │
+ │           │          │           │          │
+ │  エラー    │          │           │          │
+ │  通知表示  │          │           │          │
+ │<──────────│          │           │          │
+```
+
+**解説:**
+1. ユーザー操作で楽観的更新が即座に実行される
+2. API Routeへのリクエストがエラーになる
+3. Collectionが自動的にロールバックを実行
+4. UIが元の状態に戻る
+5. ユーザーにエラー通知が表示される
+
+#### 🔄 複数ユーザー間のリアルタイム同期
+
+```
+User A    Component A  Collection  Electric   PostgreSQL  Collection  Component B  User B
+ │            │           │        Service        │          │            │          │
+ │ 編集       │           │          │            │          │            │          │
+ │───────────>│           │          │            │          │            │          │
+ │            │ update()  │          │            │          │            │          │
+ │            │──────────>│          │            │          │            │          │
+ │            │           │          │            │          │            │          │
+ │  即座にUI   │           │          │            │          │            │          │
+ │  更新      │           │          │            │          │            │          │
+ │<───────────│           │          │            │          │            │          │
+ │            │           │ API呼び出し            │          │            │          │
+ │            │           │─────────────────────>│          │            │          │
+ │            │           │          │            │          │            │          │
+ │            │           │          │   {txid}   │          │            │          │
+ │            │           │<─────────────────────│          │            │          │
+ │            │           │          │            │          │            │          │
+ │            │           │          │  WAL       │          │            │          │
+ │            │           │          │<───────────│          │            │          │
+ │            │           │          │            │          │            │          │
+ │            │           │  stream(txid)         │          │            │          │
+ │            │           │<─────────│            │          │            │          │
+ │  同期完了   │           │          │            │          │            │          │
+ │<───────────│           │          │            │          │            │          │
+ │            │           │          │            │          │            │          │
+ │            │           │          │  stream (同じ変更)     │            │          │
+ │            │           │          │───────────────────────>│            │          │
+ │            │           │          │            │          │ update     │          │
+ │            │           │          │            │          │───────────>│          │
+ │            │           │          │            │          │            │ 自動的に  │
+ │            │           │          │            │          │            │ UI更新   │
+ │            │           │          │            │          │            │─────────>│
+```
+
+**解説:**
+1. User AがデータをA更新
+2. Component Aが即座にUIを更新（楽観的更新）
+3. PostgreSQLにデータが書き込まれる
+4. Electric ServiceがWALから変更を検知
+5. **Electric Serviceが変更を全クライアントにブロードキャスト**
+6. **User Aには同期完了として通知**
+7. **同時にUser Bのブラウザにも同じ変更が自動的に配信される**
+8. Component Bが自動的に更新され、User BのUIに反映
+
+これにより、複数ユーザー間でのリアルタイム同期が実現されます！
+
+**ブロードキャストの重要性:**
+- Electric Serviceは1つの変更を検知すると、その変更を購読している**すべてのクライアント**に同時配信
+- ユーザーAの操作がユーザーB、C、D…のブラウザに即座に反映される
+- これにより、Googleドキュメントのような協調編集が可能になる
 
 ## 学習ポイント
 
