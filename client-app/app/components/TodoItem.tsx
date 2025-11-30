@@ -83,7 +83,7 @@ export function TodoItem({ todo }: TodoItemProps) {
 
       {/* Created date */}
       <span className="text-xs text-gray-400">
-        {new Date(todo.createdAt).toLocaleString("ja-JP", {
+        {new Date(Number(todo.createdAt)).toLocaleString("ja-JP", {
           month: "short",
           day: "numeric",
           hour: "2-digit",

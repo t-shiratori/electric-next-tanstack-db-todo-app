@@ -1,48 +1,46 @@
 "use client";
 
-import { queryCollectionOptions } from "@tanstack/query-db-collection";
+import { electricCollectionOptions } from "@tanstack/electric-db-collection";
 import { createCollection } from "@tanstack/react-db";
-import { queryClient } from "@/app/lib/queryClient";
+import { electric } from "@/app/lib/electric";
 import { errorSimulation } from "@/lib/errorSimulation";
 import { notification } from "@/lib/notification";
 import type { Category } from "@/types/category";
 import type { Todo } from "@/types/todo";
 import type { User } from "@/types/user";
 
-// TanStack DB Collection for Todos
-// This demonstrates the three pillars of TanStack DB:
-// 1. Collections - typed data sets with sync capabilities
-// 2. Live Queries - reactive queries across collections
-// 3. Optimistic Mutations - instant UI updates with server sync
+// TanStack DB Collection と Electric SQL
+// Electric SQLとTanStack DBの統合デモ:
+// 1. Electric Collection - ElectricサービスからPostgreSQLデータを同期
+// 2. Live Queries - コレクション間のリアクティブクエリ
+// 3. Optimistic Mutations - サーバー同期による即座のUI更新
+// 4. Real-time sync - データベース変更の自動更新
 
+// Electric SQLによるTodoコレクション
+// ElectricはPostgreSQLからリアルタイムでデータを自動同期
+// 書き込み操作（insert/update/delete）はOptimistic UpdatesとともにREST APIを使用
 export const todoCollection = createCollection(
-  queryCollectionOptions<Todo>({
-    // QueryClient instance (required for TanStack Query integration)
-    queryClient,
-
-    // Query key for TanStack Query integration
-    queryKey: ["todos"],
-
-    // Fetch function to load initial data
-    queryFn: async () => {
-      const response = await fetch("/api/todos");
-      if (!response.ok) {
-        throw new Error("Failed to fetch todos");
-      }
-      return response.json();
+  electricCollectionOptions<Todo>({
+    // Electric同期のShapeオプション
+    shapeOptions: {
+      url: `${electric.url}/v1/shape`,
+      params: {
+        table: "todos",
+      },
     },
 
-    // Get unique key for each item (required for tracking)
+    // 各アイテムの一意なキーを取得（追跡に必要）
     getKey: (item) => item.id,
 
-    // Handle updates when items are modified
-    // This function is called when collection.update() is invoked
+    // アイテムが変更されたときの更新処理
+    // この関数はcollection.update()が呼ばれたときに実行される
+    // Electricが変更を同期したことを確認するためにtxidを返す
     onUpdate: async ({ transaction }) => {
       const mutation = transaction.mutations[0];
       if (!mutation) return;
 
       const { original, modified } = mutation;
-      // Send update to backend API
+      // バックエンドAPIに更新を送信
       const response = await fetch(`/api/todos/${original.id}`, {
         method: "PUT",
         headers: {
@@ -59,16 +57,19 @@ export const todoCollection = createCollection(
         throw new Error(errorMessage);
       }
 
-      return response.json();
+      const data = await response.json();
+      // Electric Collectionが同期を待つためにtxidを返す
+      return { txid: data.txid };
     },
 
-    // Handle deletes when items are removed
+    // アイテムが削除されたときの削除処理
+    // Electricが変更を同期したことを確認するためにtxidを返す
     onDelete: async ({ transaction }) => {
       const mutation = transaction.mutations[0];
       if (!mutation) return;
 
       const { original } = mutation;
-      // Send delete to backend API
+      // バックエンドAPIに削除を送信
       const response = await fetch(`/api/todos/${original.id}`, {
         method: "DELETE",
         headers: {
@@ -82,15 +83,21 @@ export const todoCollection = createCollection(
         notification.error(`Delete failed: ${errorMessage}`);
         throw new Error(errorMessage);
       }
+
+      const data = await response.json();
+      // Electric Collectionが同期を待つためにtxidを返す
+      return { txid: data.txid };
     },
 
-    // Handle inserts when new items are added
+    // 新しいアイテムが追加されたときの挿入処理
+    // Electricが変更を同期したことを確認するためにtxidを返す
     onInsert: async ({ transaction }) => {
       const mutation = transaction.mutations[0];
       if (!mutation) return;
 
       const { modified } = mutation;
-      // Send create to backend API
+
+      // バックエンドAPIに作成を送信
       const response = await fetch("/api/todos", {
         method: "POST",
         headers: {
@@ -100,8 +107,8 @@ export const todoCollection = createCollection(
         body: JSON.stringify({
           title: modified.title,
           completed: modified.completed,
-          userId: modified.userId,
-          categoryId: modified.categoryId,
+          userId: modified.userId || null,
+          categoryId: modified.categoryId || null,
         }),
       });
 
@@ -112,40 +119,38 @@ export const todoCollection = createCollection(
         throw new Error(errorMessage);
       }
 
-      return response.json();
+      const data = await response.json();
+
+      // Electric Collectionが同期を待つためにtxidを返す
+      // Electricがデータベースから新しいアイテムを自動的に同期する
+      return {
+        txid: data.txid,
+      };
     },
   }),
 );
 
-// User Collection
-// Demonstrates basic collection setup with minimal configuration
+// Electric SQLによるUserコレクション
 export const userCollection = createCollection(
-  queryCollectionOptions<User>({
-    queryClient,
-    queryKey: ["users"],
-    queryFn: async () => {
-      const response = await fetch("/api/users");
-      if (!response.ok) {
-        throw new Error("Failed to fetch users");
-      }
-      return response.json();
+  electricCollectionOptions<User>({
+    shapeOptions: {
+      url: `${electric.url}/v1/shape`,
+      params: {
+        table: "users",
+      },
     },
     getKey: (item) => item.id,
   }),
 );
 
-// Category Collection
-// Demonstrates basic collection setup for taxonomy/reference data
+// Electric SQLによるCategoryコレクション
 export const categoryCollection = createCollection(
-  queryCollectionOptions<Category>({
-    queryClient,
-    queryKey: ["categories"],
-    queryFn: async () => {
-      const response = await fetch("/api/categories");
-      if (!response.ok) {
-        throw new Error("Failed to fetch categories");
-      }
-      return response.json();
+  electricCollectionOptions<Category>({
+    shapeOptions: {
+      url: `${electric.url}/v1/shape`,
+      params: {
+        table: "categories",
+      },
     },
     getKey: (item) => item.id,
   }),

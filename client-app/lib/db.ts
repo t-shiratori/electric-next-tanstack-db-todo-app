@@ -1,141 +1,175 @@
+import postgres from "postgres";
 import type { Category } from "@/types/category";
 import type { Todo } from "@/types/todo";
 import type { User } from "@/types/user";
 
-// In-memory database
-const users: User[] = [
-  {
-    id: "user-1",
-    name: "Alice Johnson",
-    email: "alice@example.com",
-    avatar: "https://i.pravatar.cc/150?img=58",
-  },
-  {
-    id: "user-2",
-    name: "Bob Smith",
-    email: "bob@example.com",
-    avatar: "https://i.pravatar.cc/150?img=10",
-  },
-  {
-    id: "user-3",
-    name: "Carol Williams",
-    email: "carol@example.com",
-    avatar: "https://i.pravatar.cc/150?img=28",
-  },
-];
+// PostgreSQL接続
+const sql = postgres(process.env.DATABASE_URL || "postgresql://postgres:password@localhost:54321/electric", {
+  max: 10,
+  idle_timeout: 20,
+  connect_timeout: 10,
+});
 
-const categories: Category[] = [
-  {
-    id: "cat-1",
-    name: "Work",
-    color: "#3b82f6",
-    description: "Work-related tasks",
-  },
-  {
-    id: "cat-2",
-    name: "Personal",
-    color: "#10b981",
-    description: "Personal tasks",
-  },
-  {
-    id: "cat-3",
-    name: "Learning",
-    color: "#f59e0b",
-    description: "Learning and education",
-  },
-];
-
-const todos: Todo[] = [
-  {
-    id: "1",
-    title: "Learn TanStack DB",
-    completed: false,
-    createdAt: Date.now() - 1000 * 60 * 5,
-    userId: "user-1",
-    categoryId: "cat-3",
-  },
-  {
-    id: "2",
-    title: "Build a sample app",
-    completed: false,
-    createdAt: Date.now() - 1000 * 60 * 3,
-    userId: "user-1",
-    categoryId: "cat-1",
-  },
-  {
-    id: "3",
-    title: "Understand live queries",
-    completed: true,
-    createdAt: Date.now() - 1000 * 60 * 1,
-    userId: "user-2",
-    categoryId: "cat-3",
-  },
-];
+// トランザクション内でtxidを取得するヘルパー関数
+async function getTxid(tx: postgres.TransactionSql): Promise<number> {
+  const result = await tx`SELECT pg_current_xact_id()::xid::text as txid`;
+  return Number.parseInt(result[0].txid, 10);
+}
 
 export const db = {
   todos: {
     findAll: async (): Promise<Todo[]> => {
-      // Simulate async operation
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      return [...todos];
+      const result = await sql`
+        SELECT id, title, completed, "createdAt", "userId", "categoryId"
+        FROM todos
+        ORDER BY "createdAt" DESC
+      `;
+      return result as unknown as Todo[];
     },
 
     findById: async (id: string): Promise<Todo | undefined> => {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      return todos.find((todo) => todo.id === id);
+      const result = await sql`
+        SELECT id, title, completed, "createdAt", "userId", "categoryId"
+        FROM todos
+        WHERE id = ${id}
+      `;
+      return result[0] as unknown as Todo | undefined;
     },
 
-    create: async (data: Omit<Todo, "id" | "createdAt">): Promise<Todo> => {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      const newTodo: Todo = {
-        ...data,
-        id: String(Date.now()),
-        createdAt: Date.now(),
-      };
-      todos.push(newTodo);
-      return newTodo;
+    create: async (data: {
+      title: string;
+      completed: boolean;
+      userId?: string;
+      categoryId?: string;
+    }): Promise<{ todo: Todo; txid: number }> => {
+      let txid = 0;
+      const todo = await sql.begin(async (tx) => {
+        txid = await getTxid(tx);
+        const id = `todo-${Date.now()}`;
+        const createdAt = Date.now();
+
+        const result = await tx`
+          INSERT INTO todos (id, title, completed, "createdAt", "userId", "categoryId")
+          VALUES (${id}, ${data.title}, ${data.completed}, ${createdAt}, ${data.userId || null}, ${data.categoryId || null})
+          RETURNING id, title, completed, "createdAt", "userId", "categoryId"
+        `;
+        return result[0] as unknown as Todo;
+      });
+
+      return { todo, txid };
     },
 
-    update: async (id: string, data: Partial<Omit<Todo, "id" | "createdAt">>): Promise<Todo | null> => {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      const index = todos.findIndex((todo) => todo.id === id);
-      if (index === -1) return null;
+    update: async (
+      id: string,
+      data: Partial<{
+        title: string;
+        completed: boolean;
+        userId: string;
+        categoryId: string;
+      }>,
+    ): Promise<{ todo: Todo; txid: number } | null> => {
+      let txid = 0;
+      const todo = await sql.begin(async (tx) => {
+        txid = await getTxid(tx);
 
-      todos[index] = { ...todos[index], ...data };
-      return todos[index];
+        const updates: string[] = [];
+        const values: unknown[] = [];
+        let paramCount = 1;
+
+        if (data.title !== undefined) {
+          updates.push(`title = $${paramCount++}`);
+          values.push(data.title);
+        }
+        if (data.completed !== undefined) {
+          updates.push(`completed = $${paramCount++}`);
+          values.push(data.completed);
+        }
+        if (data.userId !== undefined) {
+          updates.push(`"userId" = $${paramCount++}`);
+          values.push(data.userId);
+        }
+        if (data.categoryId !== undefined) {
+          updates.push(`"categoryId" = $${paramCount++}`);
+          values.push(data.categoryId);
+        }
+
+        if (updates.length === 0) {
+          const result = await tx`
+            SELECT id, title, completed, "createdAt", "userId", "categoryId"
+            FROM todos
+            WHERE id = ${id}
+          `;
+          return result[0] as unknown as Todo;
+        }
+
+        values.push(id);
+        const query = `
+          UPDATE todos
+          SET ${updates.join(", ")}
+          WHERE id = $${paramCount}
+          RETURNING id, title, completed, "createdAt", "userId", "categoryId"
+        `;
+
+        const result = await tx.unsafe(query, values as never[]);
+        return result[0] as unknown as Todo;
+      });
+
+      if (!todo) return null;
+      return { todo, txid };
     },
 
-    delete: async (id: string): Promise<boolean> => {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      const index = todos.findIndex((todo) => todo.id === id);
-      if (index === -1) return false;
+    delete: async (id: string): Promise<{ success: boolean; txid: number }> => {
+      let txid = 0;
+      const success = await sql.begin(async (tx) => {
+        txid = await getTxid(tx);
+        const result = await tx`
+          DELETE FROM todos
+          WHERE id = ${id}
+        `;
+        return result.count > 0;
+      });
 
-      todos.splice(index, 1);
-      return true;
+      return { success, txid };
     },
   },
 
   users: {
     findAll: async (): Promise<User[]> => {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      return [...users];
+      const result = await sql`
+        SELECT id, name, email, avatar
+        FROM users
+        ORDER BY name
+      `;
+      return result as unknown as User[];
     },
 
     findById: async (id: string): Promise<User | undefined> => {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      return users.find((user) => user.id === id);
+      const result = await sql`
+        SELECT id, name, email, avatar
+        FROM users
+        WHERE id = ${id}
+      `;
+      return result[0] as unknown as User | undefined;
     },
   },
 
   categories: {
     findAll: async (): Promise<Category[]> => {
-      await new Promise((resolve) => setTimeout(resolve, 100));
-      return [...categories];
+      const result = await sql`
+        SELECT id, name, color, description
+        FROM categories
+        ORDER BY name
+      `;
+      return result as unknown as Category[];
     },
 
     findById: async (id: string): Promise<Category | undefined> => {
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      return categories.find((category) => category.id === id);
+      const result = await sql`
+        SELECT id, name, color, description
+        FROM categories
+        WHERE id = ${id}
+      `;
+      return result[0] as unknown as Category | undefined;
     },
   },
 };

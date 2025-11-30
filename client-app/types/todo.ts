@@ -1,4 +1,4 @@
-export interface Todo {
+export interface Todo extends Record<string, unknown> {
   id: string;
   title: string;
   completed: boolean;
