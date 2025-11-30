@@ -18,9 +18,7 @@
 ├── client-app/              # Next.js アプリケーション
 │   ├── app/
 │   │   ├── db/
-│   │   │   └── collections.ts  # Electric Collection の定義
-│   │   ├── lib/
-│   │   │   └── electric.ts     # Electric クライアント設定
+│   │   │   └── collections.ts  # Electric Collection の定義と設定
 │   │   └── components/         # React コンポーネント
 │   └── package.json
 ├── db/

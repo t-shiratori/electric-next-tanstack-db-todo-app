@@ -2,12 +2,19 @@
 
 import { electricCollectionOptions } from "@tanstack/electric-db-collection";
 import { createCollection } from "@tanstack/react-db";
-import { electric } from "@/app/lib/electric";
 import { errorSimulation } from "@/lib/errorSimulation";
 import { notification } from "@/lib/notification";
 import type { Category } from "@/types/category";
 import type { Todo } from "@/types/todo";
 import type { User } from "@/types/user";
+
+// Electric SQL設定
+// PostgreSQLからデータを複製するElectric同期サービスに接続
+const ELECTRIC_URL = process.env.NEXT_PUBLIC_ELECTRIC_URL || "http://localhost:3000";
+
+const electric = {
+  url: ELECTRIC_URL,
+};
 
 // TanStack DB Collection と Electric SQL
 // Electric SQLとTanStack DBの統合デモ:
